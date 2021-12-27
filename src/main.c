@@ -264,8 +264,8 @@ static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 	const struct bt_df_per_adv_sync_cte_rx_param cte_rx_params = {
 		.max_cte_count = 5,
 #if defined(CONFIG_BT_CTLR_DF_ANT_SWITCH_RX)
-		.cte_type = BT_DF_CTE_TYPE_ALL,
-		.slot_durations = 0x2,
+		.cte_type = BT_DF_CTE_TYPE_AOA,
+		.slot_durations = 0x1,
 		.num_ant_ids = ARRAY_SIZE(ant_patterns),
 		.ant_ids = ant_patterns,
 #else
