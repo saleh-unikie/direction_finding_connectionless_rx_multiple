@@ -9,6 +9,8 @@ Overview
 A simple application demonstrating the BLE Direction Finding CTE Locator
 functionality by receiving and sampling sending Constant Tone Extension with
 periodic advertising PDUs.
+This example is based on the Zephyr's sample (direction_finding_connectionless_rx)
+and supports receiving of simultaneous signals of different tags/beacons.
 
 Requirements
 ************
