@@ -39,8 +39,10 @@ struct synch_info_t {
     int64_t timestamp;
 };
 
-K_FIFO_DEFINE(synch_addr_fifo);
-static sys_slist_t synch_info_list;
+enum {no_sync=0, candid_sync, ongoing_sync, done_sync};
+atomic_t sync_flag = ATOMIC_INIT(no_sync);
+struct synch_addr_t synch_addr;
+struct synch_info_t synch_info;
 
 #if defined(CONFIG_BT_CTLR_DF_ANT_SWITCH_RX)
 const static uint8_t ant_patterns[] = { 0x1, 0x2, 0x3, 0x4, 0x5,
@@ -134,7 +136,7 @@ static void sync_cb(struct bt_le_per_adv_sync *sync,
 
 	bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
 
-	printk("PER_ADV_SYNC[%u]: [DEVICE]: %s synced, "
+	printk("S\tPER_ADV_SYNC[%u]: [DEVICE]: %s synced, "
 	       "Interval 0x%04x (%u ms), PHY %s\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr,
 	       info->interval, info->interval * 5 / 4, phy2str(info->phy));
@@ -147,7 +149,7 @@ static void term_cb(struct bt_le_per_adv_sync *sync,
 
 	bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
 
-	printk("PER_ADV_SYNC[%u]: [DEVICE]: %s sync terminated\n",
+	printk("T\tPER_ADV_SYNC[%u]: [DEVICE]: %s sync terminated\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr);
 }
 
@@ -160,11 +162,12 @@ static void recv_cb(struct bt_le_per_adv_sync *sync,
 
 	bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
 	bin2hex(buf->data, buf->len, data_str, sizeof(data_str));
-
+/*
 	printk("PER_ADV_SYNC[%u]: [DEVICE]: %s, tx_power %i, "
 	       "RSSI %i, CTE %s, data length %u, data: %s\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr, info->tx_power,
 	       info->rssi, cte_type2str(info->cte_type), buf->len, data_str);
+*/
 }
 
 static void cte_recv_cb(struct bt_le_per_adv_sync *sync,
@@ -173,12 +176,13 @@ static void cte_recv_cb(struct bt_le_per_adv_sync *sync,
 	char le_addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(&(sync->addr), le_addr, sizeof(le_addr));
-
+/*
 	printk("CTE[%u]: [DEVICE]: %s, samples count %d, cte type %s, "
 	       "slot durations: %u [us], packet status %s, RSSI %i\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr, report->sample_count,
 	       cte_type2str(report->cte_type), report->slot_durations,
 	       pocket_status2str(report->packet_status), report->rssi);
+*/
 }
 
 static void scan_recv(const struct bt_le_scan_recv_info *info,
@@ -192,7 +196,7 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 	bt_data_parse(buf, data_cb, name);
 
 	bt_addr_le_to_str(info->addr, le_addr, sizeof(le_addr));
-
+/*
 	printk("[DEVICE]: %s, AD evt type %u, Tx Pwr: %i, RSSI %i %s C:%u S:%u "
 	       "D:%u SR:%u E:%u Prim: %s, Secn: %s, Interval: 0x%04x (%u ms), "
 	       "SID: %u\n",
@@ -204,18 +208,14 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 	       (info->adv_props & BT_GAP_ADV_PROP_EXT_ADV) != 0,
 	       phy2str(info->primary_phy), phy2str(info->secondary_phy),
 	       info->interval, info->interval * 5 / 4, info->sid);
-
+*/
 	if (info->interval != 0) {
-		/* copy address and sid */
-		struct synch_addr_t synch_addr;
-		bt_addr_le_copy(&(synch_addr.addr), info->addr);
-		synch_addr.sid = info->sid;
-		/* reserve a space from heap */
-		char *mem_ptr = k_malloc(sizeof(struct synch_addr_t));
-		__ASSERT_NO_MSG(mem_ptr != 0);
-		memcpy(mem_ptr, &synch_addr, sizeof(struct synch_addr_t));
-		/* append to the list */
-		k_fifo_put(&synch_addr_fifo, mem_ptr);
+		if (bt_le_per_adv_sync_lookup_addr(info->addr, info->sid) == NULL) {
+			if (atomic_cas(&sync_flag, no_sync, candid_sync)) {
+				bt_addr_le_copy(&(synch_addr.addr), info->addr);
+				synch_addr.sid = info->sid;
+			}
+		}
 	}
 }
 
@@ -224,13 +224,16 @@ static int create_sync(bt_addr_le_t *address, uint8_t sid,
 {
 	int err;
 	struct bt_le_per_adv_sync_param sync_create_param;
+	char le_addr[BT_ADDR_LE_STR_LEN];
 
-	printk("Creating Periodic Advertising Sync...");
+	bt_addr_le_to_str(address, le_addr, sizeof(le_addr));
+
+	printk("C\tCreating Sync:[DEVICE]: %s ...", le_addr);
 	bt_addr_le_copy(&sync_create_param.addr, address);
 
 	sync_create_param.options = BT_LE_PER_ADV_SYNC_OPT_SYNC_ONLY_CONST_TONE_EXT;
 	sync_create_param.sid = sid;
-	sync_create_param.skip = 0;
+	sync_create_param.skip = 1;
 	sync_create_param.timeout = 2000;
 	err = bt_le_per_adv_sync_create(&sync_create_param, synch);
 	if (err != 0) {
@@ -273,12 +276,12 @@ static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 #endif /* CONFIG_BT_CTLR_DF_ANT_SWITCH_RX */
 	};
 
-	printk("Enable receiving of CTE...\n");
+	/* printk("Enable receiving of CTE..."); */
 	err = bt_df_per_adv_sync_cte_rx_enable(synch, &cte_rx_params);
 	if (err != 0) {
-		printk("failed (err %d)\n", err);
+		/* printk("failed (err %d)\n", err); */
 	} else {
-		printk("success. CTE receive enabled.\n");
+		/* printk("success.\n"); */
 	}
 
 	return err;
@@ -286,13 +289,13 @@ static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 
 static int scan_init(void)
 {
-	printk("Scan callbacks register...");
+	/* printk("Scan callbacks register..."); */
 	bt_le_scan_cb_register(&scan_callbacks);
-	printk("success.\n");
+	/* printk("success.\n"); */
 
-	printk("Periodic Advertising callbacks register...");
+	/* printk("Periodic Advertising callbacks register..."); */
 	bt_le_per_adv_sync_cb_register(&sync_callbacks);
-	printk("success.\n");
+	/* printk("success.\n"); */
 
 	return 0;
 }
@@ -308,13 +311,13 @@ static int scan_enable(void)
 	int err;
 
 	if (!scan_enabled) {
-		printk("Start scanning...");
+		/* printk("Start scanning..."); */
 		err = bt_le_scan_start(&param, NULL);
 		if (err != 0) {
-			printk("failed (err %d)\n", err);
+			/* printk("failed (err %d)\n", err); */
 			return err;
 		}
-		printk("success\n");
+		/* printk("success\n"); */
 		scan_enabled = true;
 	}
 
@@ -325,13 +328,13 @@ static void scan_disable(void)
 {
 	int err;
 
-	printk("Scan disable...");
+	/* printk("Scan disable..."); */
 	err = bt_le_scan_stop();
 	if (err != 0) {
-		printk("failed (err %d)\n", err);
+		/* printk("___failed (err %d)\n", err); */
 		return;
 	}
-	printk("Success.\n");
+	/* printk("Success.\n"); */
 
 	scan_enabled = false;
 }
@@ -339,6 +342,7 @@ static void scan_disable(void)
 void main(void)
 {
 	int err;
+	int last_time_scan_refresh = k_uptime_get();
 
 	printk("Starting Connectionless Locator Demo\n");
 
@@ -352,54 +356,45 @@ void main(void)
 	scan_init();
 
 	scan_enabled = false;
+	scan_enable();
+
 	do {
-		scan_enable();
 
-		/* get the address of advertiser device from fifo, to be synched */
-		struct synch_addr_t *synch_addr = k_fifo_get(&synch_addr_fifo, K_NO_WAIT);
-
-		if (synch_addr != NULL) {
-			printk("Trying to make a new periodic sync...\n");
-			/* is this address in progress (duplicate)? */
-			if (bt_le_per_adv_sync_lookup_addr(&(synch_addr->addr), synch_addr->sid) == NULL) {
-				/* get a new space from heap */
-				struct synch_info_t *synch_info_heap = k_malloc(sizeof(struct synch_info_t));
-				__ASSERT_NO_MSG(synch_info_heap != 0);
-				
-				/* set timestamp and create the synch obj */
-				synch_info_heap->timestamp = k_uptime_get();			
-				if (create_sync(&(synch_addr->addr), synch_addr->sid, 
-								 &(synch_info_heap->synch_ptr)) != 0) {
-					/* creating the synch was failed, free the memory */
-					k_free(synch_info_heap);
-					/* give a fresh scan */
-					scan_disable();
-					scan_enable();
-				} else {
-					/* append the new synch object to the list */
-					sys_slist_append(&synch_info_list, &(synch_info_heap->node));
-				}
+		/* refresh scan every 10seconds */
+		if(10000 < (k_uptime_get()-last_time_scan_refresh)) {
+			/* if a sync is ongoing, don't refresh */
+			if (atomic_cas(&sync_flag, no_sync, no_sync)) {
+				scan_disable();
+				scan_enable();
 			}
 
-			/* release the memory used to store advertiser address */
-			k_free(synch_addr);
-
+			last_time_scan_refresh = k_uptime_get();
 		}
 
-		/* iterate the list to check synch object status */
-		struct synch_info_t *synch_info_ptr = NULL;
-		sys_snode_t *pre_node_ptr = NULL;
-		struct synch_info_t *tmp_ptr = NULL;
-		SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&synch_info_list, synch_info_ptr, tmp_ptr, node) {
+		if (atomic_cas(&sync_flag, candid_sync, ongoing_sync)) {			
+			if (create_sync(&(synch_addr.addr), synch_addr.sid, 
+								&(synch_info.synch_ptr)) != 0) {
+				/* creating the synch was failed, be ready for next sync */
+				atomic_set(&sync_flag, no_sync);
+				/* give a fresh scan */
+				scan_disable();
+				scan_enable();
+			} else {
+				/* set timestamp and create the synch obj */
+				synch_info.timestamp = k_uptime_get();
+			}
+		}
+
+
+		if(atomic_cas(&sync_flag, ongoing_sync, ongoing_sync)) {
 			/* is there any synch created or is it terminated? */
-			if(!atomic_test_bit(synch_info_ptr->synch_ptr->flags, BT_PER_ADV_SYNC_CREATED)) {
-				printk("Periodic sync lost...\n");
+			if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_CREATED)) {
+				/* printk("Periodic sync lost...\n"); */
 				/* disable and delete corresponding objects */
-				bt_df_per_adv_sync_cte_rx_disable(synch_info_ptr->synch_ptr);
-				delete_sync(synch_info_ptr->synch_ptr);
-				/* remove the node from list and free the memory */
-				sys_slist_remove(&synch_info_list, pre_node_ptr, &(synch_info_ptr->node));
-				k_free(synch_info_ptr);
+				bt_df_per_adv_sync_cte_rx_disable(synch_info.synch_ptr);
+				delete_sync(synch_info.synch_ptr);
+				/* creating the synch was failed, be ready for next sync */
+				atomic_set(&sync_flag, no_sync);
 				/* give a fresh scan */
 				scan_disable();
 				scan_enable();
@@ -408,14 +403,13 @@ void main(void)
 			}
 
 			/* it is created, check timeout and synched status */
-			if(!atomic_test_bit(synch_info_ptr->synch_ptr->flags, BT_PER_ADV_SYNC_SYNCED)) {
-				if ((synch_info_ptr->timestamp + TIMEOUT_SYNC_CREATE_MS) < k_uptime_get()) {
-					printk("Periodic sync timeout...\n");
+			if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_SYNCED)) {
+				if ((synch_info.timestamp + TIMEOUT_SYNC_CREATE_MS) < k_uptime_get()) {
+					printk("Periodic sync timeout...");
 					/* disable and delete corresponding objects */
-					delete_sync(synch_info_ptr->synch_ptr);
-					/* remove the node from list and free the memory */
-					sys_slist_remove(&synch_info_list, pre_node_ptr, &(synch_info_ptr->node));
-					k_free(synch_info_ptr);
+					delete_sync(synch_info.synch_ptr);
+					/* creating the synch was failed, be ready for next sync */
+					atomic_set(&sync_flag, no_sync);
 					/* give a fresh scan */
 					scan_disable();
 					scan_enable();
@@ -423,32 +417,36 @@ void main(void)
 					continue;
 				}
 			/* if is created and synched, enable cte if already is not */
-			} else if(!atomic_test_bit(synch_info_ptr->synch_ptr->flags, BT_PER_ADV_SYNC_CTE_ENABLED)) {				
-				printk("Enable CTE RX...");
-				if (enable_cte_rx(synch_info_ptr->synch_ptr) != 0) {
-					printk("Enabling CTE RX failed\n");
+			} else if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_CTE_ENABLED)) {				
+				/* printk("Enable CTE RX..."); */
+				if (enable_cte_rx(synch_info.synch_ptr) != 0) {
+					printk("Enabling CTE RX failed...");
 					/* disable and delete corresponding objects */
-					delete_sync(synch_info_ptr->synch_ptr);
-					/* remove the node from list and free the memory */
-					sys_slist_remove(&synch_info_list, pre_node_ptr, &(synch_info_ptr->node));
-					k_free(synch_info_ptr);
+					delete_sync(synch_info.synch_ptr);
+					/* creating the synch was failed, be ready for next sync */
+					atomic_set(&sync_flag, no_sync);
 					/* give a fresh scan */
 					scan_disable();
 					scan_enable();
 
 					continue;
 				} else {
-					printk("Done!\n");
+					/* creating the synch was successful, be ready for next sync */
+					atomic_set(&sync_flag, no_sync);
+					/* give a fresh scan */
+					scan_disable();
+					scan_enable();
+
+					continue;
 				}
 			}
 
 			/* if we are here, it means a connection is ongoing! */
-			//bt_addr_le_to_str(&(synch_info_ptr->synch_ptr->addr), le_addr, sizeof(le_addr));
-			//printk("list-> addr:%s, time:%lli\n", le_addr, synch_info_ptr->timestamp);
-
-			/* update previuse node pointer */
-			pre_node_ptr = &(synch_info_ptr->node);
+			//bt_addr_le_to_str(&(synch_info.synch_ptr->addr), le_addr, sizeof(le_addr));
+			//printk("list-> addr:%s, time:%lli\n", le_addr, synch_info.timestamp);
 		}
+
+		k_msleep(100);
 
 	} while (true);
 }
