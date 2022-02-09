@@ -21,7 +21,7 @@
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define NAME_LEN        30
-#define TIMEOUT_SYNC_CREATE_MS 10000
+#define TIMEOUT_SYNC_CREATE_MS 40000
 
 static bool scan_enabled;
 
