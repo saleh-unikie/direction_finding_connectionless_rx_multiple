@@ -231,7 +231,7 @@ static int create_sync(bt_addr_le_t *address, uint8_t sid,
 	sync_create_param.options = BT_LE_PER_ADV_SYNC_OPT_SYNC_ONLY_CONST_TONE_EXT;
 	sync_create_param.sid = sid;
 	sync_create_param.skip = 0;
-	sync_create_param.timeout = 0xa;
+	sync_create_param.timeout = 2000;
 	err = bt_le_per_adv_sync_create(&sync_create_param, synch);
 	if (err != 0) {
 		printk("failed (err %d)\n", err);
@@ -264,7 +264,7 @@ static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 	const struct bt_df_per_adv_sync_cte_rx_param cte_rx_params = {
 		.max_cte_count = 5,
 #if defined(CONFIG_BT_CTLR_DF_ANT_SWITCH_RX)
-		.cte_type = BT_DF_CTE_TYPE_AOA,
+		.cte_types = BT_DF_CTE_TYPE_AOA,
 		.slot_durations = 0x1,
 		.num_ant_ids = ARRAY_SIZE(ant_patterns),
 		.ant_ids = ant_patterns,
