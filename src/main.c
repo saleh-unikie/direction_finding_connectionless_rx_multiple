@@ -13,10 +13,8 @@
 #include <sys/util.h>
 
 #include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
+#include <bluetooth/gap.h>
 #include <bluetooth/direction.h>
-
-#include <host/hci_core.h>
 
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
@@ -26,15 +24,11 @@
 static bool scan_enabled;
 
 struct synch_addr_t {
-	/** FIFO uses first word itself, reserve space */
-	intptr_t _unused;
     bt_addr_le_t addr;
     uint8_t sid;
 };
 
 struct synch_info_t {
-	/** FIFO uses first word itself, reserve space */
-	sys_snode_t node;
     struct bt_le_per_adv_sync *synch_ptr;
     int64_t timestamp;
 };
@@ -43,6 +37,10 @@ enum {no_sync=0, candid_sync, ongoing_sync, done_sync};
 atomic_t sync_flag = ATOMIC_INIT(no_sync);
 struct synch_addr_t synch_addr;
 struct synch_info_t synch_info;
+
+static K_SEM_DEFINE(sem_per_adv, 0, 1);
+static K_SEM_DEFINE(sem_per_sync, 0, 1);
+static K_SEM_DEFINE(sem_per_sync_lost, 0, 1);
 
 #if defined(CONFIG_BT_CTLR_DF_ANT_SWITCH_RX)
 const static uint8_t ant_patterns[] = { 0x1, 0x2, 0x3, 0x4, 0x5,
@@ -140,6 +138,8 @@ static void sync_cb(struct bt_le_per_adv_sync *sync,
 	       "Interval 0x%04x (%u ms), PHY %s\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr,
 	       info->interval, info->interval * 5 / 4, phy2str(info->phy));
+
+	k_sem_give(&sem_per_sync);
 }
 
 static void term_cb(struct bt_le_per_adv_sync *sync,
@@ -173,10 +173,11 @@ static void recv_cb(struct bt_le_per_adv_sync *sync,
 static void cte_recv_cb(struct bt_le_per_adv_sync *sync,
 			struct bt_df_per_adv_sync_iq_samples_report const *report)
 {
+/*
 	char le_addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(&(sync->addr), le_addr, sizeof(le_addr));
-/*
+
 	printk("CTE[%u]: [DEVICE]: %s, samples count %d, cte type %s, "
 	       "slot durations: %u [us], packet status %s, RSSI %i\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr, report->sample_count,
@@ -214,6 +215,8 @@ static void scan_recv(const struct bt_le_scan_recv_info *info,
 			if (atomic_cas(&sync_flag, no_sync, candid_sync)) {
 				bt_addr_le_copy(&(synch_addr.addr), info->addr);
 				synch_addr.sid = info->sid;
+
+				k_sem_give(&sem_per_adv);
 			}
 		}
 	}
@@ -233,7 +236,7 @@ static int create_sync(bt_addr_le_t *address, uint8_t sid,
 
 	sync_create_param.options = BT_LE_PER_ADV_SYNC_OPT_SYNC_ONLY_CONST_TONE_EXT;
 	sync_create_param.sid = sid;
-	sync_create_param.skip = 1;
+	sync_create_param.skip = 0;
 	sync_create_param.timeout = 2000;
 	err = bt_le_per_adv_sync_create(&sync_create_param, synch);
 	if (err != 0) {
@@ -356,97 +359,78 @@ void main(void)
 	scan_init();
 
 	scan_enabled = false;
-	scan_enable();
 
 	do {
+		/* enable scan */
+		scan_enable();
 
-		/* refresh scan every 10seconds */
-		if(10000 < (k_uptime_get()-last_time_scan_refresh)) {
-			/* if a sync is ongoing, don't refresh */
-			if (atomic_cas(&sync_flag, no_sync, no_sync)) {
-				scan_disable();
-				scan_enable();
-			}
+		/* if there is any candidate to be synced, create the sync */
+		atomic_set(&sync_flag, no_sync);
+		/* wait until when a new candidate is ready to be synced */
+		err = k_sem_take(&sem_per_adv, K_MSEC(10000));
+		switch (err) {
+			/* error */
+			case -EBUSY:
+				printk("k_sem_take failed (err %d). App terminated#\n", err);
+				return;
+				break;
 
-			last_time_scan_refresh = k_uptime_get();
-		}
-
-		if (atomic_cas(&sync_flag, candid_sync, ongoing_sync)) {			
-			if (create_sync(&(synch_addr.addr), synch_addr.sid, 
-								&(synch_info.synch_ptr)) != 0) {
-				/* creating the synch was failed, be ready for next sync */
-				atomic_set(&sync_flag, no_sync);
+			/* time out */
+			case -EAGAIN:
 				/* give a fresh scan */
 				scan_disable();
-				scan_enable();
-			} else {
-				/* set timestamp and create the synch obj */
-				synch_info.timestamp = k_uptime_get();
-			}
-		}
-
-
-		if(atomic_cas(&sync_flag, ongoing_sync, ongoing_sync)) {
-			/* is there any synch created or is it terminated? */
-			if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_CREATED)) {
-				/* printk("Periodic sync lost...\n"); */
-				/* disable and delete corresponding objects */
-				bt_df_per_adv_sync_cte_rx_disable(synch_info.synch_ptr);
-				delete_sync(synch_info.synch_ptr);
-				/* creating the synch was failed, be ready for next sync */
-				atomic_set(&sync_flag, no_sync);
-				/* give a fresh scan */
-				scan_disable();
-				scan_enable();
-
+				/* start from begining of the loop again */
 				continue;
-			}
 
-			/* it is created, check timeout and synched status */
-			if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_SYNCED)) {
-				if ((synch_info.timestamp + TIMEOUT_SYNC_CREATE_MS) < k_uptime_get()) {
-					printk("Periodic sync timeout...");
-					/* disable and delete corresponding objects */
-					delete_sync(synch_info.synch_ptr);
-					/* creating the synch was failed, be ready for next sync */
-					atomic_set(&sync_flag, no_sync);
-					/* give a fresh scan */
-					scan_disable();
-					scan_enable();
-
-					continue;
-				}
-			/* if is created and synched, enable cte if already is not */
-			} else if(!atomic_test_bit(synch_info.synch_ptr->flags, BT_PER_ADV_SYNC_CTE_ENABLED)) {				
-				/* printk("Enable CTE RX..."); */
-				if (enable_cte_rx(synch_info.synch_ptr) != 0) {
-					printk("Enabling CTE RX failed...");
-					/* disable and delete corresponding objects */
-					delete_sync(synch_info.synch_ptr);
-					/* creating the synch was failed, be ready for next sync */
-					atomic_set(&sync_flag, no_sync);
-					/* give a fresh scan */
-					scan_disable();
-					scan_enable();
-
-					continue;
-				} else {
-					/* creating the synch was successful, be ready for next sync */
-					atomic_set(&sync_flag, no_sync);
-					/* give a fresh scan */
-					scan_disable();
-					scan_enable();
-
-					continue;
-				}
-			}
-
-			/* if we are here, it means a connection is ongoing! */
-			//bt_addr_le_to_str(&(synch_info.synch_ptr->addr), le_addr, sizeof(le_addr));
-			//printk("list-> addr:%s, time:%lli\n", le_addr, synch_info.timestamp);
+			default:
+				; /* do nothing! */
 		}
 
-		k_msleep(100);
+		err = create_sync(&(synch_addr.addr), synch_addr.sid,
+						  &(synch_info.synch_ptr));
+		if (err != 0) {
+			printk("XC\tCreating sync failed (err %d)\n", err);
+			/* give a fresh scan */
+			scan_disable();
+			/* start from begining of the loop again */
+			continue;
+		} else {
+			/* set timestamp and create the synch obj */
+			synch_info.timestamp = k_uptime_get();
+		}
+
+		/* check the sync process and make it go forward until when CTE is enabled */
+		err = k_sem_take(&sem_per_sync, K_MSEC(TIMEOUT_SYNC_CREATE_MS));
+		if (err != 0) {
+			printk("XC\tCreating sync timed out\n", err);
+			err = delete_sync(synch_info.synch_ptr);
+			if (err != 0) {
+				printk("delete_sync failed (err %d). App terminated#\n", err);
+				return;
+			}
+
+			/* give a fresh scan */
+			scan_disable();
+
+			/* start from begining of the loop again */
+			continue;
+		}
+
+
+		err = enable_cte_rx(synch_info.synch_ptr);
+		if (err != 0) {
+			printk("XC\tCreating sync timed out\n", err);
+			/* disable and delete corresponding objects */
+			delete_sync(synch_info.synch_ptr);
+
+			/* give a fresh scan */
+			scan_disable();
+
+			continue;
+		}
+
+		/* give a fresh scan */
+		scan_disable();
 
 	} while (true);
 }
