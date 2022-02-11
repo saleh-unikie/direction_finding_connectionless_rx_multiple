@@ -346,6 +346,7 @@ void main(void)
 {
 	int err;
 	int last_time_scan_refresh = k_uptime_get();
+	int timeout_cnt = 0;
 
 	printk("Starting Connectionless Locator Demo\n");
 
@@ -367,7 +368,7 @@ void main(void)
 		/* if there is any candidate to be synced, create the sync */
 		atomic_set(&sync_flag, no_sync);
 		/* wait until when a new candidate is ready to be synced */
-		err = k_sem_take(&sem_per_adv, K_MSEC(10000));
+		err = k_sem_take(&sem_per_adv, K_MSEC(15000));
 		switch (err) {
 			/* error */
 			case -EBUSY:
@@ -377,13 +378,20 @@ void main(void)
 
 			/* time out */
 			case -EAGAIN:
+				printk(".");
+				++timeout_cnt;
+				if (timeout_cnt == 20) {
+					printk("\n");
+					timeout_cnt = 0;
+				}
 				/* give a fresh scan */
 				scan_disable();
 				/* start from begining of the loop again */
 				continue;
+				break;
 
 			default:
-				; /* do nothing! */
+				timeout_cnt = 0;
 		}
 
 		err = create_sync(&(synch_addr.addr), synch_addr.sid,
@@ -402,7 +410,7 @@ void main(void)
 		/* check the sync process and make it go forward until when CTE is enabled */
 		err = k_sem_take(&sem_per_sync, K_MSEC(TIMEOUT_SYNC_CREATE_MS));
 		if (err != 0) {
-			printk("XC\tCreating sync timed out\n", err);
+			printk("XC\tCreating sync timed out\n");
 			err = delete_sync(synch_info.synch_ptr);
 			if (err != 0) {
 				printk("delete_sync failed (err %d). App terminated#\n", err);
@@ -416,18 +424,15 @@ void main(void)
 			continue;
 		}
 
-
+		
 		err = enable_cte_rx(synch_info.synch_ptr);
 		if (err != 0) {
-			printk("XC\tCreating sync timed out\n", err);
-			/* disable and delete corresponding objects */
+			printk("XC\tenable_cte_rx failed\n", err);
 			delete_sync(synch_info.synch_ptr);
-
-			/* give a fresh scan */
 			scan_disable();
-
 			continue;
 		}
+		
 
 		/* give a fresh scan */
 		scan_disable();
