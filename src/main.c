@@ -16,6 +16,9 @@
 #include <bluetooth/gap.h>
 #include <bluetooth/direction.h>
 
+#include <bluetooth/hci.h>
+#include <host/hci_core.h>
+
 #define DEVICE_NAME     CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #define NAME_LEN        30
@@ -33,7 +36,7 @@ struct synch_info_t {
     int64_t timestamp;
 };
 
-enum {no_sync=0, candid_sync, ongoing_sync, done_sync};
+enum {no_sync=0, candid_sync, ongoing_sync, terminated_sync, done_sync};
 atomic_t sync_flag = ATOMIC_INIT(no_sync);
 struct synch_addr_t synch_addr;
 struct synch_info_t synch_info;
@@ -151,6 +154,12 @@ static void term_cb(struct bt_le_per_adv_sync *sync,
 
 	printk("T\tPER_ADV_SYNC[%u]: [DEVICE]: %s sync terminated\n",
 	       bt_le_per_adv_sync_get_index(sync), le_addr);
+
+	if (synch_info.synch_ptr == sync) {
+		if (atomic_cas(&sync_flag, ongoing_sync, terminated_sync)) {
+			k_sem_give(&sem_per_sync);
+		}
+	}
 }
 
 static void recv_cb(struct bt_le_per_adv_sync *sync,
@@ -234,7 +243,9 @@ static int create_sync(bt_addr_le_t *address, uint8_t sid,
 	printk("C\tCreating Sync:[DEVICE]: %s ...", le_addr);
 	bt_addr_le_copy(&sync_create_param.addr, address);
 
-	sync_create_param.options = BT_LE_PER_ADV_SYNC_OPT_SYNC_ONLY_CONST_TONE_EXT;
+	sync_create_param.options = BT_LE_PER_ADV_SYNC_OPT_SYNC_ONLY_CONST_TONE_EXT|
+                                BT_LE_PER_ADV_SYNC_OPT_DONT_SYNC_AOD_1US |
+                                BT_LE_PER_ADV_SYNC_OPT_DONT_SYNC_AOD_1US;
 	sync_create_param.sid = sid;
 	sync_create_param.skip = 0;
 	sync_create_param.timeout = 2000;
@@ -251,14 +262,16 @@ static int create_sync(bt_addr_le_t *address, uint8_t sid,
 static int delete_sync(struct bt_le_per_adv_sync *synch)
 {
 	int err;
+	char le_addr[BT_ADDR_LE_STR_LEN];
 
-	printk("Deleting Periodic Advertising Sync...");
+	bt_addr_le_to_str(&(synch->addr), le_addr, sizeof(le_addr));
+
+	printk("D\tDeleting Sync of [DEVICE]: %s\n", le_addr);
 	err = bt_le_per_adv_sync_delete(synch);
 	if (err != 0) {
 		printk("failed (err %d)\n", err);
 		return err;
 	}
-	printk("success\n");
 
 	return 0;
 }
@@ -266,6 +279,7 @@ static int delete_sync(struct bt_le_per_adv_sync *synch)
 static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 {
 	int err;
+	char le_addr[BT_ADDR_LE_STR_LEN];
 
 	const struct bt_df_per_adv_sync_cte_rx_param cte_rx_params = {
 		.max_cte_count = 5,
@@ -279,12 +293,14 @@ static int enable_cte_rx(struct bt_le_per_adv_sync *synch)
 #endif /* CONFIG_BT_CTLR_DF_ANT_SWITCH_RX */
 	};
 
+	bt_addr_le_to_str(&(synch->addr), le_addr, sizeof(le_addr));
+	printk("E\t[DEVICE]: %s enabling CTE ... ", le_addr);
 	/* printk("Enable receiving of CTE..."); */
 	err = bt_df_per_adv_sync_cte_rx_enable(synch, &cte_rx_params);
 	if (err != 0) {
 		/* printk("failed (err %d)\n", err); */
 	} else {
-		/* printk("success.\n"); */
+		printk("success.\n");
 	}
 
 	return err;
@@ -347,6 +363,7 @@ void main(void)
 	int err;
 	int last_time_scan_refresh = k_uptime_get();
 	int timeout_cnt = 0;
+	char le_addr[BT_ADDR_LE_STR_LEN];
 
 	printk("Starting Connectionless Locator Demo\n");
 
@@ -394,23 +411,37 @@ void main(void)
 				timeout_cnt = 0;
 		}
 
-		err = create_sync(&(synch_addr.addr), synch_addr.sid,
-						  &(synch_info.synch_ptr));
-		if (err != 0) {
-			printk("XC\tCreating sync failed (err %d)\n", err);
+		if (atomic_cas(&sync_flag, candid_sync, ongoing_sync)) {
+			err = create_sync(&(synch_addr.addr), synch_addr.sid,
+					&(synch_info.synch_ptr));
+			if (err != 0) {
+				bt_addr_le_to_str(&(synch_addr.addr), le_addr, sizeof(le_addr));
+				printk("XC\tCreating sync [DEVICE]: %s failed (err %d)\n", le_addr, err);
+				/* give a fresh scan */
+				scan_disable();
+				/* start from begining of the loop again */
+				continue;
+			} else {
+				/* set timestamp and create the synch obj */
+				synch_info.timestamp = k_uptime_get();
+			}
+		} else {
 			/* give a fresh scan */
 			scan_disable();
 			/* start from begining of the loop again */
 			continue;
-		} else {
-			/* set timestamp and create the synch obj */
-			synch_info.timestamp = k_uptime_get();
 		}
 
 		/* check the sync process and make it go forward until when CTE is enabled */
 		err = k_sem_take(&sem_per_sync, K_MSEC(TIMEOUT_SYNC_CREATE_MS));
-		if (err != 0) {
-			printk("XC\tCreating sync timed out\n");
+		if (err != 0 || atomic_cas(&sync_flag, terminated_sync, terminated_sync)) {
+			bt_addr_le_to_str(&(synch_info.synch_ptr->addr), le_addr, sizeof(le_addr));
+			if (err != 0) {
+				printk("XO\tCreating sync [DEVICE]: %s  timed out\n", le_addr);
+			} else {
+				printk("XT\tCreating sync [DEVICE]: %s  terminated\n", le_addr);
+			}
+			
 			err = delete_sync(synch_info.synch_ptr);
 			if (err != 0) {
 				printk("delete_sync failed (err %d). App terminated#\n", err);
@@ -419,20 +450,19 @@ void main(void)
 
 			/* give a fresh scan */
 			scan_disable();
-
 			/* start from begining of the loop again */
 			continue;
 		}
 
-		
 		err = enable_cte_rx(synch_info.synch_ptr);
 		if (err != 0) {
-			printk("XC\tenable_cte_rx failed\n", err);
+			printk("XE\tenable_cte_rx failed\n");
 			delete_sync(synch_info.synch_ptr);
 			scan_disable();
 			continue;
 		}
-		
+
+		k_busy_wait(50000);		
 
 		/* give a fresh scan */
 		scan_disable();
